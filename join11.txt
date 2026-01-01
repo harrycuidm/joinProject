@@ -1,0 +1,2027 @@
+# -*- coding: utf-8 -*-
+"""
+JoinQuant | A股 | 三支柱统筹（并行打分 + 统筹决策）
+
+基于 join_Think.txt 的设计：
+1) 行业轮动只做“加分/扣分”，不做行业筛除（避免漏斗式样本塌缩）
+2) Alpha 因子做“规模 + 行业哑变量”正交化，提取纯个股残差收益
+3) 自优化模块监控两支柱的滚动 IC，动态调整两者在总分中的权重
+
+最终：FinalScore = w_ind * IndustryVec + w_alpha * AlphaVec
+"""
+
+from jqdata import *  # noqa: F401,F403
+import builtins
+import numpy as np
+import pandas as pd
+class Config:
+    def __init__(self):
+        self._cooldown_left = 0 
+        self._idx_cd_armed = True 
+        self.allow_contrarian = False 
+        self.alpha_growth_accel_lag = 60 
+        self.alpha_growth_accel_on = False 
+        self.alpha_growth_accel_weight = 0.0 
+        self.alpha_lowvol_lb = 60 
+        self.alpha_lowvol_on = False 
+        self.alpha_lowvol_weight = 0.0 
+        self.alpha_mom_on = True 
+        self.alpha_mom_raw_on = False 
+        self.alpha_mom_raw_weight = 0.0 
+        self.alpha_mom_weight = 0.0 
+        self.alpha_neutralize = True 
+        self.alpha_regime_accel_scale = (1.0, 1.0)
+        self.alpha_regime_growth_scale = (1.0, 1.0)
+        self.alpha_regime_lowvol_scale = (1.0, 1.0)
+        self.alpha_regime_mom_raw_scale = (1.0, 1.0)
+        self.alpha_regime_mom_scale = (1.0, 1.0)
+        self.alpha_regime_on = False 
+        self.alpha_regime_quality_scale = (1.0, 1.0)
+        self.alpha_regime_value_scale = (1.0, 1.0) 
+        self.alpha_resid_min_obs = 80 
+        self.alpha_weights = {} 
+        self.atr_win = 14 
+        self.buy_mom_lb = 0 
+        self.buy_mom_min = -0.05 
+        self.buy_mom_q = 0.50 
+        self.buy_mom_skip = 5 
+        self.buy_trend_filter = False 
+        self.buy_trend_ma = 120 
+        self.cash_reserve = 0.0 
+        self.exit_buffer = 1.0 
+        self.expo_gamma = 1.0 
+        self.expo_smooth_alpha = 0.75 
+        self.expo_step_max = 0.10 
+        self.filter_price_floor = True 
+        self.full_liquidate_on_cooldown = True 
+        self.fund_limit_band = 0.003 
+        self.ic_halflife = 3.0 
+        self.ic_hist = {} 
+        self.ic_horizon = 20
+    # 基准与股票池（建议先用中证500保证速度；如需全市场可替换为 000985.XSHG）
+def set_params(context):
+    g.conf.benchmark = "000905.XSHG"
+    g.conf.stock_pool = "000905.XSHG"
+
+    # 再平衡与持仓规模（降低换手，减少交易日拖累）
+    g.conf.rebalance_every = 7  # lower turnover
+    g.conf.day_count = 0
+    g.conf.topN = 15
+    g.conf.minN = 10
+    g.conf.exit_buffer = 1.08  # ?????rank<=N*exit_buffer ????
+    g.conf.trade_tol = 0.015  # ????????????????
+    # 按 join_Think：不做“惯性混合”，换手用约束控制（避免信号滞后 3-4 个月）
+    g.conf.rebalance_blend = 0.0  # 目标权重与现仓权重混合（不推荐，保留为可选开关）
+    g.conf.max_turnover = 0.60  # reduce churn
+    g.conf.size_weight_power = 0.0  # ????????????
+    g.conf.max_single_weight = 0.18  # 单票上限（绝对权重）
+    g.conf.min_stock_pos_value = 8000.0  # 单票最小资金（避免风险Off下持仓碎片化）
+    g.conf.liq_weight_ref = 2.0e7  # ????????????????
+
+    # 基础过滤：上市/市值/流动性（不是策略信号过滤，只做可交易性约束）
+    g.conf.min_days_listed = 180
+    # 按 join_Think：放开小市值区间以释放 Alpha
+    g.conf.min_mktcap = 8.0e8
+    g.conf.max_mktcap = 5e11
+    g.conf.liq_lookback = 60
+    g.conf.liq_quantile = 0.30
+    g.conf.liq_min_money = 2.0e7
+    g.conf.liq_fallback_top_n = 250
+    g.conf.quality_filter_on = True
+    g.conf.quality_min_roe = 0.08
+    g.conf.quality_min_profit_growth = 0.03
+    g.conf.quality_min_rev_growth = 0.02
+
+    # 价格底线（可选，避免面值退市风险）
+    g.conf.filter_price_floor = True
+    g.conf.price_floor = 1.5
+
+    # ---------------- Pillar 1：板块轮动（并行打分，不做筛除） ----------------
+    g.conf.ind_lookback = 40
+    g.conf.ind_money_win = 10
+    g.conf.ind_hot_n = 3
+    g.conf.ind_cold_n = 3
+    g.conf.ind_crowd_lookback = 120
+
+    # ---------------- Pillar 2：正交化 Alpha（并行打分） ----------------
+    g.conf.alpha_neutralize = True
+    g.conf.alpha_weights = dict(value=0.05, quality=0.12, growth=0.12)
+    g.conf.alpha_mom_on = True
+    g.conf.alpha_mom_weight = 3.40  # reduce trend chasing
+    g.conf.mom12_lb = 120
+    g.conf.mom12_skip = 20
+    g.conf.mom_multi_on = True
+    g.conf.mom_short_lb = 20
+    g.conf.mom_short_skip = 5
+    g.conf.mom_mid_lb = 60
+    g.conf.mom_mid_skip = 10
+    g.conf.mom_long_lb = 120
+    g.conf.mom_long_skip = 20
+    g.conf.mom_w_short = 0.15
+    g.conf.mom_w_mid = 0.35
+    g.conf.mom_w_long = 0.50
+    g.conf.alpha_resid_min_obs = 60
+    # 按 join_Think：尽量减少“滞后同比”的噪声（用“增长加速度”近似 SUE/盈利动量）
+    g.conf.alpha_growth_accel_on = True
+    g.conf.alpha_growth_accel_weight = 0.30
+    g.conf.alpha_growth_accel_lag = 60  # 近似一个季度（交易日）
+    # Raw momentum (no size/industry orthogonalization) for trend capture
+    g.conf.alpha_mom_raw_on = True
+    g.conf.alpha_mom_raw_weight = 1.60
+    g.conf.alpha_lowvol_on = True
+    g.conf.alpha_lowvol_weight = 0.35
+    g.conf.alpha_lowvol_lb = 60
+    g.conf.mom_vol_lb = 60
+    # Regime-aware factor scaling (risk_on -> more momentum/growth; risk_off -> more quality/lowvol)
+    g.conf.alpha_regime_on = True
+    g.conf.alpha_regime_value_scale = (0.95, 0.85)
+    g.conf.alpha_regime_quality_scale = (1.10, 0.85)
+    g.conf.alpha_regime_growth_scale = (0.70, 1.40)
+    g.conf.alpha_regime_accel_scale = (0.70, 1.40)
+    g.conf.alpha_regime_mom_scale = (0.80, 2.20)
+    g.conf.alpha_regime_mom_raw_scale = (0.80, 2.40)
+    g.conf.alpha_regime_lowvol_scale = (1.10, 0.80)
+
+
+    # ---------------- Pillar 3：自优化（统筹者，调整两支柱话语权） ----------------
+    g.conf.meta_enabled = False
+    g.conf.ic_horizon = int(g.conf.rebalance_every)
+    g.conf.ic_window = 8
+    g.conf.ic_min_obs = 6
+    g.conf.meta_smooth = 0.75
+    g.conf.allow_contrarian = False
+    g.conf.meta_use_ir = True  # 用 IC_IR（均值/波动）评估稳定性
+    g.conf.meta_min_ir = 0.03  # ???IR??????
+    g.conf.meta_min_ic = 0.005  # ????IC??????
+    g.conf.ic_halflife = 3.0  # IC 指标指数加权半衰期（以“再平衡次数”为单位）
+    g.conf.meta_w = {"ind": 0.10, "alpha": 0.90}
+    g.conf.meta_sign = {"ind": 1.0, "alpha": 1.0}
+    g.conf.sig_snapshots = []  # list[dict(date=..., signals=DataFrame[ind,alpha])]
+    g.conf.ic_hist = {"ind": [], "alpha": []}
+    g.conf.ic_diag = {}
+
+    # 风险识别与仓位映射（尽量稳定，避免频繁 Risk-Off/On 造成交易拖累）
+    g.conf.ma_short = 30
+    g.conf.ma_long = 120
+    g.conf.ma_band_short = 0.006
+    g.conf.ma_band_long = 0.012
+    g.conf.vol_lookback = 20
+    g.conf.vol_target = 0.25
+    g.conf.vol_scale_min = 0.80
+    g.conf.vol_scale_max = 1.80
+    g.conf.expo_gamma = 1.20
+    g.conf.expo_step_max = 0.80
+    g.conf.expo_smooth_alpha = 0.15
+    g.conf.inv_vol_power = 0.30
+
+    g.conf.idx_dd_lookback = 250
+    g.conf.idx_dd_stop = 0.15
+    g.conf.idx_dd_recover = 0.10
+    g.conf.idx_dd_cooldown = 0.20
+    g.conf.idx_dd_cooldown_recover = 0.10
+    g.conf.risk_off_threshold = 0.30
+    g.conf.risk_on_threshold = 0.50
+
+    # ?????????????????/???
+    g.conf.signal_gate_on = True
+    g.conf.signal_gate_q = 0.62
+    g.conf.signal_gate_min = 0.010
+    g.conf.signal_gate_expo = 0.90
+    g.conf.signal_gate_risk_on = 0.55
+    g.conf.signal_gate_skip_on_risk = True
+    g.conf.signal_expo_on = True
+    g.conf.signal_expo_min = 0.75
+    g.conf.signal_expo_max = 1.00
+    g.conf.signal_boost_on = True
+    g.conf.signal_boost_th = 0.70
+    g.conf.signal_boost_min_expo = 0.92
+    g.conf.signal_disp_min = 0.30
+    g.conf.signal_disp_max = 1.10
+    g.conf.ind_aux_on = False
+    g.conf.ind_disp_min = 0.20
+    g.conf.ind_disp_max = 0.95
+
+    g.conf.buy_trend_filter = True
+    g.conf.buy_trend_ma = 60
+    g.conf.trend_filter_regime_on = False
+    g.conf.trend_filter_risk_on = 0.55
+    g.conf.buy_mom_lb = 60
+    g.conf.buy_mom_skip = 10
+    g.conf.buy_mom_q = 0.55
+    g.conf.buy_mom_min = 0.01
+    g.conf.buy_mom_week_lb = 10
+    g.conf.buy_mom_week_skip = 2
+    g.conf.buy_mom_week_q = 0.55
+    g.conf.buy_mom_week_min = 0.005
+    g.conf.buy_mom_month_lb = 5
+    g.conf.buy_mom_month_skip = 1
+    g.conf.buy_mom_month_q = 0.55
+    g.conf.buy_mom_month_min = 0.01
+    g.conf.buy_mom_gate = False
+    g.conf.strict_mom_gate = False
+
+    # 按 join_Think：默认不做全仓位择时，长期保持接近满仓
+    g.conf.risk_overlay_on = True
+    g.conf.stock_expo_max = 1.00
+    g.conf.stock_expo_min = 0.60
+    g.conf.stock_expo_bear = 0.25
+    g.conf.stock_expo_cur = g.conf.stock_expo_max
+    g.conf.expo_boost_on = 0.70
+    g.conf.expo_boost_min = 0.95
+
+    # 避险资产（按 join_Think 默认关闭，避免 ETF 反复切换摩擦）
+    g.conf.safe_on = True
+    g.conf.safe_etf = "511880.XSHG"  # bond ETF
+    g.conf.safe_etf2 = "511990.XSHG"  # money market ETF
+    g.conf.safe_etf2_weight = 0.0
+    g.conf.safe_rebalance_every = 10
+    g.conf.safe_trade_tol_pct = 0.005
+    g.conf.safe_trade_tol_value = 15000.0
+    g.conf.cash_reserve = 0.0
+
+    # 动态止盈止损（按 join_Think 默认关闭，避免“洗盘止损 + 冷却期踏空”）
+    g.conf.use_stops = False
+    g.conf.atr_win = 14
+    g.conf.vol_win = 60
+    g.conf.stop_loss_pct = 0.08
+    g.conf.stop_atr_mult = 2.3
+    g.conf.trail_pct_min = 0.06
+    g.conf.trail_pct_max = 0.22
+    g.conf.stop_confirm_days = 2
+    g.conf.stop_confirm_vol_thr = 0.055
+    g.conf.stop_min_hold_days = 7
+    g.conf.stop_reentry_cooldown = 10
+    g.conf.partial_tp = True
+    g.conf.tp_atr_mult = 5.0
+    g.conf.tp_fraction = 0.5
+
+    # 交易与滑点
+    g.conf.slip_for_cash = 0.003
+    g.conf.stock_limit_band = 0.01
+    g.conf.fund_limit_band = 0.003
+
+    # 组合级风控
+    g.conf.port_high = None
+    g.conf.port_dd_stop = 0.20
+    g.conf.port_dd_cooldown_days = 5
+    g.conf._cooldown_left = 0
+    g.conf.full_liquidate_on_cooldown = True
+    g.conf._idx_cd_armed = True
+
+    # 状态
+    g.conf.risk_off = False
+    g.conf.last_market = {}
+    g.conf.pos_state = {}
+    g.conf.stop_blacklist = {}
+    g.conf.debug = False
+
+
+def initialize(context):
+    g.conf = Config()
+    set_params(context)
+    set_benchmark(g.conf.benchmark)
+    try:
+        set_option("avoid_future_data", True)
+    except Exception as e:
+        try:
+            log.warn(f"Error caught: {e}")
+        except:
+            print(f'Error caught: {e}')
+    set_option("use_real_price", True)
+    log.set_level("order", "info")
+
+    set_order_cost(
+        OrderCost(open_tax=0, close_tax=0.001, open_commission=0.00015, close_commission=0.00015, close_today_commission=0, min_commission=5),
+        type="stock",
+    )
+    try:
+        set_order_cost(
+            OrderCost(open_tax=0, close_tax=0.0, open_commission=0.0001, close_commission=0.0001, close_today_commission=0, min_commission=0),
+            type="fund",
+        )
+    except Exception as e:
+        try:
+            log.warn(f"Error caught: {e}")
+        except:
+            print(f'Error caught: {e}')
+    set_slippage(PriceRelatedSlippage(0.0015))
+
+    # 15:00 已收盘（实盘不可下单），回测也容易造成撮合偏差；改为收盘前下单
+    run_daily(task_trade, time="14:50")
+
+
+def task_trade(context):
+    today = context.current_dt.date()
+    end_dt = prev_trade_day(today)
+
+    mkt = {"risk_score": 1.0, "risk_off_now": False, "regime_changed": False, "idx_vol": np.nan, "idx_dd": 0.0}
+    if bool(g.conf.risk_overlay_on):
+        update_portfolio_dd_brake(context)
+        mkt = calc_market_state(end_dt)
+        apply_risk_overlay(context, end_dt, mkt)
+        if bool(g.conf.use_stops):
+            manage_position_stops(context, end_dt, mkt)
+        if g.conf._cooldown_left > 0:
+            g.conf._cooldown_left -= 1
+    else:
+        g.conf.stock_expo_cur = float(g.conf.stock_expo_max)
+
+    if bool(g.conf.meta_enabled):
+        update_meta_weights_by_ic(end_dt)
+
+    g.conf.day_count += 1
+    force = False
+    if bool(g.conf.risk_overlay_on):
+        force = bool(mkt.get("regime_changed", False)) or (g.conf._cooldown_left > 0 and bool(g.conf.full_liquidate_on_cooldown))
+    if (g.conf.day_count % int(g.conf.rebalance_every) == 0)            or force:
+        rebalance(context, end_dt=end_dt, mkt=mkt)
+    else:
+        if bool(g.conf.safe_on):
+            safe_every = int(g.conf.safe_rebalance_every)
+            if bool(mkt.get("regime_changed", False)) or (safe_every > 0 and (g.conf.day_count % safe_every == 0)):
+                adjust_safe_assets(context, end_dt, mkt, force=False)
+
+
+# -------------------- 交易/价格工具 --------------------
+def _get_pos_if_any(context, code):
+    """避免 JQ PositionDict 在 key 不存在时产生 WARNING。"""
+    try:
+        pos_dict = context.portfolio.positions
+        if code in pos_dict:
+            return pos_dict[code]
+        return None
+    except Exception:
+        try:
+            return context.portfolio.positions.get(code, None)
+        except Exception:
+            return None
+
+
+def _cd_get(code):
+    cd = get_current_data()
+    try:
+        return cd[code]
+    except Exception:
+        try:
+            return cd.get(code, None)
+        except Exception:
+            return None
+
+
+def _is_fund_like(code):
+    base = code.split(".")[0]
+    return (len(base) >= 1) and (base[0] in ("1", "5"))
+
+
+def _trend_ok(code, end_dt):
+    if not bool(g.conf.buy_trend_filter):
+        return True
+    if end_dt is None:
+        return True
+    win = int(g.conf.buy_trend_ma)
+    if win <= 1:
+        return True
+    if bool(g.conf.trend_filter_regime_on):
+        mkt = dict(g.conf.last_market or {})
+        risk_score = float(np.clip(mkt.get("risk_score", 0.5), 0.0, 1.0))
+        risk_on = float(g.conf.trend_filter_risk_on)
+        if risk_score >= risk_on:
+            return True
+    try:
+        px = get_price(code, count=win, end_date=end_dt, fields=["close"], panel=False)
+        px = _sort_price_df(px)
+        if px is None or px.empty or len(px) < win:
+            return True
+        close = px["close"].astype(float)
+        last = float(close.iloc[-1])
+        ma = float(close.mean())
+        if np.isfinite(last) and np.isfinite(ma):
+            return last >= ma
+    except Exception:
+        return True
+    return True
+
+
+def can_buy(code, end_dt=None):
+    d = _cd_get(code)
+    if d is None or getattr(d, "paused", False):
+        return False
+    if (not _is_fund_like(code)) and getattr(d, "is_st", False):
+        return False
+    if _is_fund_like(code):
+        return True
+    p = d.last_price or d.day_open
+    hl = getattr(d, "high_limit", None)
+    ll = getattr(d, "low_limit", None)
+    if p and hl and p >= 0.999 * hl:
+        return False
+    if p and ll and p <= 1.001 * ll:
+        return False
+    if not _trend_ok(code, end_dt):
+        return False
+    return True
+
+
+def can_sell(code):
+    d = _cd_get(code)
+    if d is None or getattr(d, "paused", False):
+        return False
+    if _is_fund_like(code):
+        return True
+    p = d.last_price or d.day_open
+    ll = getattr(d, "low_limit", None)
+    if p and ll and p <= 1.001 * ll:
+        return False
+    return True
+
+
+def _as_date(x):
+    if isinstance(x, pd.Timestamp):
+        return x.date()
+    try:
+        return x.date()
+    except Exception:
+        return x
+
+
+def prev_trade_day(dt_like):
+    d = _as_date(dt_like)
+    days = get_all_trade_days()
+    i = int(np.searchsorted(days, d, side="left") - 1)
+    return days[max(i, 0)]
+
+
+def shift_trade_day(dt_like, n):
+    d = _as_date(dt_like)
+    days = get_all_trade_days()
+    i = int(np.searchsorted(days, d, side="left"))
+    j = int(np.clip(i + int(n), 0, len(days) - 1))
+    return days[j]
+
+
+def last_price_or_prev_close(code, end_dt):
+    d = _cd_get(code)
+    p = d.last_price or d.day_open if d is not None else None
+    if p is None or p <= 0:
+        try:
+            px = get_price(code, count=1, end_date=end_dt, fields=["close"], panel=False)
+            p = float(px["close"].iloc[-1])
+        except Exception:
+            p = np.nan
+    return float(p)
+
+
+def _protect_limit_price(code, side, ref_price):
+    d = _cd_get(code)
+    p = d.last_price or d.day_open if d is not None else None
+    p = float(p) if (p is not None and p > 0) else float(ref_price)
+    hl = getattr(d, "high_limit", None) if d is not None else None
+    ll = getattr(d, "low_limit", None) if d is not None else None
+
+    if _is_fund_like(code):
+        band = float(g.conf.fund_limit_band)
+        band = float(np.clip(band, 0.001, 0.02))
+        if side == "buy":
+            lp = p * (1 + band)
+            if hl and hl > 0:
+                lp = min(lp, float(hl))
+        else:
+            lp = p * (1 - band)
+            if ll and ll > 0:
+                lp = max(lp, float(ll))
+        return float(lp)
+
+    band = float(g.conf.stock_limit_band)
+    band = float(np.clip(band, 0.002, 0.05))
+    if side == "buy":
+        lp = p * (1 + band)
+        if hl and hl > 0:
+            lp = min(lp, float(hl))
+    else:
+        lp = p * (1 - band)
+        if ll and ll > 0:
+            lp = max(lp, float(ll))
+    return float(lp)
+
+
+def order_target_limited(context, code, target_amount):
+    if target_amount is None:
+        return
+    pos = _get_pos_if_any(context, code)
+    cur_amt = int(pos.total_amount) if pos is not None else 0
+    target_amount = int(target_amount)
+    if target_amount == cur_amt:
+        return
+    ref = last_price_or_prev_close(code, prev_trade_day(context.current_dt.date()))
+    side = "buy" if target_amount > cur_amt else "sell"
+    lp = _protect_limit_price(code, side=side, ref_price=ref)
+    if (lp is None) or (not np.isfinite(lp)) or lp <= 0:
+        order_target(code, target_amount)
+    else:
+        order_target(code, target_amount, style=LimitOrderStyle(lp))
+
+
+def order_target_value_lot(context, code, target_value, end_dt, lot=100):
+    if target_value is None:
+        return
+    target_value = max(float(target_value), 0.0)
+    p = last_price_or_prev_close(code, end_dt)
+    if (not np.isfinite(p)) or p <= 0:
+        return
+    lot_value = p * float(lot)
+    tgt_amt = int(target_value / lot_value) * int(lot)
+    tgt_amt = max(tgt_amt, 0)
+
+    pos = _get_pos_if_any(context, code)
+    cur_amt = int(pos.total_amount) if pos is not None else 0
+    if abs(tgt_amt - cur_amt) < lot:
+        return
+
+    if tgt_amt > cur_amt:
+        if not can_buy(code, end_dt=end_dt):
+            return
+        diff = tgt_amt - cur_amt
+        cash = float(context.portfolio.available_cash)
+        est_unit = p * (1.0 + g.conf.slip_for_cash)
+        max_affordable_lots = int((cash - g.conf.cash_reserve) / (est_unit * lot))
+        max_affordable = max_affordable_lots * lot
+        if max_affordable < lot:
+            return
+        diff = min(diff, max_affordable)
+        tgt_amt = cur_amt + diff
+        if abs(tgt_amt - cur_amt) < lot:
+            return
+    else:
+        if not can_sell(code):
+            return
+
+    order_target_limited(context, code, tgt_amt)
+
+
+# -------------------- 工具：鲁棒标准化 --------------------
+def winsorize(s, n=3.0):
+    s = s.astype(float)
+    if s.isnull().all():
+        return s
+    med = float(s.median())
+    mad = float((s - med).abs().median())
+    if (not np.isfinite(mad)) or mad <= 0:
+        return s
+    limit = float(n) * 1.4826 * mad
+    return s.clip(med - limit, med + limit)
+
+
+def zscore(s):
+    s = s.astype(float)
+    if s.isnull().all() or s.std() == 0:
+        return s * 0.0
+    return (s - s.mean()) / s.std()
+
+
+def _sort_price_df(px):
+    if px is None or px.empty:
+        return px
+    if "time" in px.columns:
+        return px.sort_values("time")
+    if "date" in px.columns:
+        return px.sort_values("date")
+    return px
+
+
+# -------------------- 市场风险识别 --------------------
+def calc_market_state(end_dt):
+    idx = g.conf.benchmark
+    ma_s = int(g.conf.ma_short)
+    ma_l = int(g.conf.ma_long)
+    band_s = float(g.conf.ma_band_short)
+    band_l = float(g.conf.ma_band_long)
+    vol_win = int(g.conf.vol_lookback)
+    dd_win = int(g.conf.idx_dd_lookback)
+
+    cnt = int(max(ma_l, vol_win, dd_win) + 5)
+    px = get_price(idx, count=cnt, end_date=end_dt, fields=["close"], panel=False)
+    if px is None or (isinstance(px, pd.DataFrame) and px.empty):
+        return {"risk_score": 0.5, "idx_vol": np.nan, "idx_dd": 0.0, "risk_off_now": False, "regime_changed": False}
+
+    if isinstance(px, pd.DataFrame):
+        s = px["close"] if "close" in px.columns else px.iloc[:, 0]
+    else:
+        s = px
+    s = pd.to_numeric(s, errors="coerce").dropna()
+    if len(s) < max(ma_l, vol_win, dd_win) + 1:
+        return {"risk_score": 0.5, "idx_vol": np.nan, "idx_dd": 0.0, "risk_off_now": False, "regime_changed": False}
+
+    last = float(s.iloc[-1])
+    ma_s_val = float(s.iloc[-ma_s:].mean()) if ma_s > 0 else np.nan
+    ma_l_val = float(s.iloc[-ma_l:].mean()) if ma_l > 0 else np.nan
+    ratio_s = float(last / ma_s_val) if (np.isfinite(ma_s_val) and ma_s_val > 0) else np.nan
+    ratio_l = float(last / ma_l_val) if (np.isfinite(ma_l_val) and ma_l_val > 0) else np.nan
+
+    def _band_score(ratio, band):
+        if (not np.isfinite(ratio)) or band <= 0:
+            if not np.isfinite(ratio):
+                return 0.5
+            return 1.0 if ratio >= 1.0 else 0.0
+        return float(np.clip((ratio - (1.0 - band)) / (2.0 * band), 0.0, 1.0))
+
+    s_long = _band_score(ratio_l, band_l)
+    s_short = _band_score(ratio_s, band_s)
+    risk_score = float(np.clip(0.70 * s_long + 0.30 * s_short, 0.0, 1.0))
+
+    r = s.pct_change().dropna()
+    if len(r) >= vol_win and vol_win > 2:
+        vol = float(r.iloc[-vol_win:].std())
+    else:
+        vol = float(r.std()) if len(r) > 5 else np.nan
+    idx_vol = float(vol * np.sqrt(252)) if (np.isfinite(vol) and vol > 0) else np.nan
+
+    hi = float(s.iloc[-dd_win:].max())
+    idx_dd = float(last / hi - 1.0) if (np.isfinite(hi) and hi > 0) else 0.0
+
+    off_th = float(g.conf.risk_off_threshold)
+    dd_stop = float(g.conf.idx_dd_stop)
+    risk_off_now = bool(risk_score < off_th) and bool(idx_dd <= -dd_stop)
+    prev_regime = bool(g.conf.risk_off)
+    regime_changed = bool(prev_regime != risk_off_now)
+
+    return {
+        "risk_score": risk_score,
+        "idx_vol": idx_vol,
+        "idx_dd": idx_dd,
+        "risk_off_now": risk_off_now,
+        "regime_changed": regime_changed,
+        "ratio_s": ratio_s,
+        "ratio_l": ratio_l,
+    }
+
+
+def update_portfolio_dd_brake(context):
+    total = float(getattr(context.portfolio, "total_value", 0.0))
+    if not np.isfinite(total) or total <= 0:
+        return
+    port_high = g.conf.port_high
+    if (port_high is None) or (not np.isfinite(port_high)) or (total > port_high):
+        g.conf.port_high = total
+        port_high = total
+    dd = total / port_high - 1.0 if port_high > 0 else 0.0
+    dd_stop = float(g.conf.port_dd_stop)
+    if dd <= -dd_stop and int(g.conf._cooldown_left) <= 0:
+        g.conf._cooldown_left = int(g.conf.port_dd_cooldown_days)
+        g.conf.port_high = total
+        if bool(g.conf.full_liquidate_on_cooldown):
+            g.conf.risk_off = True
+
+
+def apply_risk_overlay(context, end_dt, mkt):
+    risk_score = float(np.clip(mkt.get("risk_score", 0.5), 0.0, 1.0))
+    idx_vol = float(mkt.get("idx_vol", np.nan))
+    idx_dd = float(mkt.get("idx_dd", 0.0))
+
+    expo_max = float(g.conf.stock_expo_max)
+    expo_min = float(g.conf.stock_expo_min)
+    expo_bear = float(g.conf.stock_expo_bear)
+
+    gamma = float(g.conf.expo_gamma)
+    gamma = float(np.clip(gamma, 0.20, 2.0))
+    base_expo = expo_bear + (expo_max - expo_bear) * (risk_score**gamma)
+
+    vol_target = float(g.conf.vol_target)
+    vol_scale_min = float(g.conf.vol_scale_min)
+    vol_scale_max = float(g.conf.vol_scale_max)
+    if np.isfinite(idx_vol) and idx_vol > 0 and np.isfinite(vol_target) and vol_target > 0:
+        vol_scale = float(np.clip(vol_target / idx_vol, vol_scale_min, vol_scale_max))
+    else:
+        vol_scale = 1.0
+
+    expo_target = float(np.clip(base_expo * vol_scale, expo_min, expo_max))
+
+    # 指数极端回撤：进入冷静期（带“武装/解除武装”避免长期锁死）
+    dd_stop = float(g.conf.idx_dd_stop)
+    dd_cd = float(g.conf.idx_dd_cooldown)
+    dd_cd_rec = float(g.conf.idx_dd_cooldown_recover)
+    armed = bool(g.conf._idx_cd_armed)
+    if idx_dd > -dd_cd_rec:
+        g.conf._idx_cd_armed = True
+        armed = True
+    if armed and (g.conf._cooldown_left <= 0) and (idx_dd <= -dd_cd):
+        g.conf._cooldown_left = int(g.conf.port_dd_cooldown_days)
+        g.conf._idx_cd_armed = False
+        if bool(g.conf.full_liquidate_on_cooldown):
+            expo_target = 0.0
+
+    # 风险状态：滞后（hysteresis）
+    prev_off = bool(g.conf.risk_off)
+    off_th = float(g.conf.risk_off_threshold)
+    on_th = float(g.conf.risk_on_threshold)
+    dd_rec = float(g.conf.idx_dd_recover)
+
+    raw_off = bool(risk_score < off_th) and bool(idx_dd <= -dd_stop)
+    if g.conf._cooldown_left > 0:
+        risk_off = True
+    else:
+        if prev_off:
+            risk_off = not (risk_score > on_th and idx_dd > -dd_rec)
+        else:
+            risk_off = raw_off
+
+    g.conf.risk_off = bool(risk_off) or bool(mkt.get("risk_off_now", False))
+
+    if g.conf.risk_off:
+        expo_target = min(expo_target, expo_bear)
+
+    boost_on = float(getattr(g.conf, "expo_boost_on", 1.0))
+    boost_min = float(getattr(g.conf, "expo_boost_min", expo_max))
+    if (not g.conf.risk_off) and (risk_score >= boost_on):
+        expo_target = max(expo_target, float(np.clip(boost_min, 0.0, expo_max)))
+
+    prev_expo = float(np.clip(g.conf.stock_expo_cur, 0.0, 1.0))
+    target = float(np.clip(expo_target, 0.0, 1.0))
+    step_max = float(np.clip(g.conf.expo_step_max, 0.0, 1.0))
+    if step_max > 0:
+        delta = target - prev_expo
+        if abs(delta) > step_max:
+            target = prev_expo + np.sign(delta) * step_max
+
+    smooth = float(np.clip(g.conf.expo_smooth_alpha, 0.0, 0.95))
+    g.conf.stock_expo_cur = float(np.clip(smooth * prev_expo + (1.0 - smooth) * target, 0.0, 1.0))
+
+    g.conf.last_market = dict(mkt)
+    g.conf.last_market.update({
+        "risk_off": g.conf.risk_off,
+        "raw_off": raw_off,
+        "expo_target": expo_target,
+        "expo_final": g.conf.stock_expo_cur,
+    })
+
+
+def industry_series(stocks, end_dt=None):
+    res = {}
+    for s in stocks:
+        try:
+            ind = get_industry(s, date=end_dt) if end_dt is not None else get_industry(s)
+            code = None
+            if isinstance(ind, dict):
+                if "industry_code" in ind:
+                    code = ind.get("industry_code", None)
+                else:
+                    for key in ("sw_l1", "jq_l1", "sw_l2", "jq_l2"):
+                        if key in ind and isinstance(ind[key], dict):
+                            code = ind[key].get("industry_code", None)
+                            if code:
+                                break
+            res[s] = code
+        except Exception:
+            res[s] = None
+    return pd.Series(res)
+
+
+def build_universe(end_dt):
+    pool = list(get_index_stocks(g.conf.stock_pool, date=end_dt))
+    if not pool:
+        return []
+
+    today = end_dt
+    cd = get_current_data()
+
+    def enough_days(s):
+        try:
+            return (today - get_security_info(s).start_date).days >= int(g.conf.min_days_listed)
+        except Exception:
+            return False
+
+    def ok_basic(s):
+        try:
+            d = cd[s]
+        except Exception:
+            return False
+        if getattr(d, "is_st", False) or getattr(d, "paused", False):
+            return False
+        if bool(g.conf.filter_price_floor):
+            floor = float(g.conf.price_floor)
+            p = d.last_price or d.day_open
+            try:
+                p = float(p) if (p is not None) else np.nan
+            except Exception:
+                p = np.nan
+            if np.isfinite(p) and np.isfinite(floor) and floor > 0 and p < floor:
+                return False
+        return True
+
+    pool = [s for s in pool if enough_days(s) and ok_basic(s)]
+    if not pool:
+        return []
+    pool_basic = list(pool)
+
+    # Liquidity filter (fallback keeps universe non-empty)
+    lb = int(g.conf.liq_lookback)
+    px = get_price(pool, count=lb, end_date=end_dt, fields=["money", "close"], panel=False)
+    if px is None or px.empty:
+        return pool_basic
+    money = px.pivot(index="time", columns="code", values="money").mean()
+    money = money.replace([np.inf, -np.inf], np.nan).dropna()
+    if money.empty:
+        return pool_basic
+    q = float(np.clip(g.conf.liq_quantile, 0.0, 1.0))
+    thr = float(money.quantile(q))
+    thr = max(thr, float(g.conf.liq_min_money))
+    pool = [s for s in pool if (s in money.index and np.isfinite(money[s]) and float(money[s]) >= thr)]
+    if not pool:
+        top_n = int(g.conf.liq_fallback_top_n)
+        pool = list(money.sort_values(ascending=False).head(min(top_n, len(money))).index)
+        if not pool:
+            return pool_basic
+
+    if bool(g.conf.filter_price_floor) and ("close" in px.columns):
+        try:
+            close_med = px.pivot(index="time", columns="code", values="close").median()
+            floor = float(g.conf.price_floor)
+            pool = [s for s in pool if (s in close_med.index and np.isfinite(close_med[s]) and float(close_med[s]) >= floor)]
+        except Exception as e:
+            try:
+                log.warn(f"Error caught: {e}")
+            except:
+                print(f'Error caught: {e}')
+        if not pool:
+            pool = pool_basic
+
+    # 市值过滤
+    pool_mc_base = list(pool)
+    q = query(valuation.code, valuation.market_cap).filter(valuation.code.in_(pool))
+    mc = get_fundamentals(q, date=end_dt)
+    if mc is None or mc.empty:
+        return pool_mc_base
+    mc = mc.set_index("code")["market_cap"] * 1e8
+    mn = float(g.conf.min_mktcap)
+    mx = float(g.conf.max_mktcap)
+    ok = set(mc[(mc >= mn) & (mc <= mx)].index.tolist())
+    filtered = [s for s in pool if s in ok]
+    
+    filtered = filtered if filtered else pool_mc_base
+
+    if bool(getattr(g.conf, "quality_filter_on", False)):
+        try:
+            q2 = query(valuation.code, indicator.roe, indicator.inc_net_profit_year_on_year, indicator.inc_revenue_year_on_year)\
+                .filter(valuation.code.in_(filtered))
+            f2 = get_fundamentals(q2, date=end_dt)
+            if f2 is not None and (not f2.empty):
+                f2 = f2.set_index("code")
+                roe = pd.to_numeric(f2.get("roe"), errors="coerce")
+                gp = pd.to_numeric(f2.get("inc_net_profit_year_on_year"), errors="coerce")
+                gr = pd.to_numeric(f2.get("inc_revenue_year_on_year"), errors="coerce")
+                min_roe = float(getattr(g.conf, "quality_min_roe", 0.0))
+                min_gp = float(getattr(g.conf, "quality_min_profit_growth", -1e9))
+                min_gr = float(getattr(g.conf, "quality_min_rev_growth", -1e9))
+                ok2 = set(f2.index[(roe >= min_roe) & (gp >= min_gp) & (gr >= min_gr)])
+                filtered2 = [s for s in filtered if s in ok2]
+                if len(filtered2) >= max(50, int(0.3 * len(filtered))):
+                    filtered = filtered2
+        except Exception:
+            pass
+
+    return filtered
+
+
+# -------------------- Pillar 1：行业轮动（并行打分） --------------------
+def calc_industry_turnover_crowding(stocks, ind, end_dt, lookback=240):
+    lb = int(max(30, int(lookback)))
+    try:
+        px = get_price(stocks, count=lb, end_date=end_dt, fields=["turnover_rate"], panel=False)
+    except Exception:
+        return pd.DataFrame()
+    if px is None or px.empty or ("turnover_rate" not in px.columns):
+        return pd.DataFrame()
+    tr = px.pivot(index="time", columns="code", values="turnover_rate").sort_index()
+    if tr.empty:
+        return pd.DataFrame()
+
+    ind_map = ind.reindex(tr.columns)
+    groups = {}
+    for code, ind_code in ind_map.items():
+        if ind_code is None or (isinstance(ind_code, float) and np.isnan(ind_code)):
+            continue
+        groups.setdefault(ind_code, []).append(code)
+
+    out = {}
+    for ind_code, cols in groups.items():
+        if not cols:
+            continue
+        s = tr[cols].median(axis=1)
+        s = pd.to_numeric(s, errors="coerce").replace([np.inf, -np.inf], np.nan).dropna()
+        if len(s) < 20:
+            continue
+        last = float(s.iloc[-1])
+        med = float(s.median())
+        mad = float((s - med).abs().median())
+        denom = 1.4826 * mad
+        z = float((last - med) / denom) if (np.isfinite(denom) and denom > 0) else 0.0
+        pct = float(s.rank(pct=True).iloc[-1]) if len(s) > 1 else 0.5
+        out[ind_code] = {"z": z, "pct": pct}
+    return pd.DataFrame(out).T if out else pd.DataFrame()
+
+
+def compute_industry_vec(stocks, end_dt):
+    if not stocks:
+        return pd.Series(dtype=float), {}
+
+    lookback = int(g.conf.ind_lookback)
+    win_money = int(g.conf.ind_money_win)
+    ind = industry_series(stocks, end_dt=end_dt)
+
+    try:
+        px = get_price(stocks, count=lookback + 1, end_date=end_dt, fields=["close", "money"], panel=False)
+    except Exception:
+        px = get_price(stocks, count=lookback + 1, end_date=end_dt, fields=["close"], panel=False)
+    if px is None or px.empty:
+        return pd.Series(0.0, index=stocks), {}
+
+    close = px.pivot(index="time", columns="code", values="close").sort_index()
+    if close.shape[0] < 10:
+        return pd.Series(0.0, index=stocks), {}
+    ret = (close.iloc[-1] / close.iloc[0] - 1.0).replace([np.inf, -np.inf], np.nan)
+
+    money_trend = pd.Series(0.0, index=close.columns)
+    if "money" in px.columns:
+        try:
+            money = px.pivot(index="time", columns="code", values="money").sort_index().replace([np.inf, -np.inf], np.nan).fillna(0.0)
+            w = int(max(5, min(win_money, money.shape[0] // 2)))
+            m2 = money.iloc[-w:].mean()
+            m1 = money.iloc[:w].mean()
+            money_trend = (m2 / m1.replace(0, np.nan) - 1.0).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+        except Exception as e:
+            try:
+                log.warn(f"Error caught: {e}")
+            except:
+                print(f'Error caught: {e}')
+
+    df = pd.DataFrame({"ret": ret.reindex(stocks), "money": money_trend.reindex(stocks), "ind": ind.reindex(stocks)}).dropna(subset=["ind"])
+    if df.empty:
+        return pd.Series(0.0, index=stocks), {}
+
+    ind_mom = df.groupby("ind")["ret"].median()
+    ind_money = df.groupby("ind")["money"].median()
+
+    crowd_df = calc_industry_turnover_crowding(stocks, ind, end_dt, lookback=int(g.conf.ind_crowd_lookback))
+    ind_crowd = crowd_df["z"] if (crowd_df is not None and (not crowd_df.empty) and ("z" in crowd_df.columns)) else pd.Series(0.0, index=ind_mom.index)
+    ind_crowd = ind_crowd.reindex(ind_mom.index).fillna(0.0)
+
+    score = zscore(winsorize(ind_mom)) + 0.5 * zscore(winsorize(ind_money)) - 0.5 * zscore(winsorize(ind_crowd))
+    score = score.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+
+    # 按 join_Think：行业打分连续化（Z-Score 映射），避免 Top3=1 之外全为 0 的信息浪费
+    score_z = zscore(winsorize(score)).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    score_rank = score.sort_values(ascending=False)
+
+    hot_n = int(max(1, g.conf.ind_hot_n))
+    cold_n = int(max(1, g.conf.ind_cold_n))
+    hot = score_rank.head(hot_n).index.tolist()
+    cold = score_rank.tail(cold_n).index.tolist()
+
+    vec = ind.map(score_z).astype(float).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    vec = vec.reindex(stocks).fillna(0.0).clip(-2.5, 2.5)
+
+    diag = {"industry_score": score_rank.to_dict(), "industry_score_z": score_z.to_dict(), "hot": hot, "cold": cold}
+    return vec, diag
+
+
+# -------------------- Pillar 2：正交化 Alpha（并行打分） --------------------
+def _resid_by_size_industry(factor, log_mc, ind_code, min_obs=80):
+    y = factor.astype(float)
+    x_size = log_mc.astype(float)
+    ind = ind_code.astype(object)
+    df = pd.DataFrame({"y": y, "size": x_size, "ind": ind}).replace([np.inf, -np.inf], np.nan).dropna()
+    if df.shape[0] < int(min_obs):
+        return pd.Series(0.0, index=y.index)
+
+    df["size"] = zscore(winsorize(df["size"])).fillna(0.0)
+    dummies = pd.get_dummies(df["ind"], prefix="ind", dummy_na=False)
+    if dummies.shape[1] > 1:
+        dummies = dummies.iloc[:, 1:]
+
+    X = pd.concat([pd.Series(1.0, index=df.index, name="const"), df["size"], dummies], axis=1)
+    Y = df["y"].values.astype(float)
+    A = X.values.astype(float)
+    try:
+        beta, _, _, _ = np.linalg.lstsq(A, Y, rcond=None)
+        resid = Y - A.dot(beta)
+    except Exception:
+        resid = Y - float(np.mean(Y))
+
+    out = pd.Series(np.nan, index=y.index)
+    out.loc[df.index] = resid
+    out = zscore(winsorize(out)).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    return out
+
+
+def compute_alpha_vec(stocks, end_dt):
+    if not stocks:
+        return pd.Series(dtype=float), {}
+
+    q = query(
+        valuation.code,
+        valuation.pe_ratio,
+        valuation.pb_ratio,
+        valuation.ps_ratio,
+        valuation.pcf_ratio,
+        valuation.market_cap,
+        indicator.roe,
+        indicator.roa,
+        indicator.gross_profit_margin,
+        indicator.inc_net_profit_year_on_year,
+        indicator.inc_revenue_year_on_year,
+    ).filter(valuation.code.in_(stocks))
+    f = get_fundamentals(q, date=end_dt)
+    f = f.set_index("code") if (f is not None and (not f.empty)) else pd.DataFrame(index=stocks)
+
+    pe = pd.to_numeric(f["pe_ratio"], errors="coerce") if "pe_ratio" in f.columns else pd.Series(index=stocks, dtype=float)
+    pb = pd.to_numeric(f["pb_ratio"], errors="coerce") if "pb_ratio" in f.columns else pd.Series(index=stocks, dtype=float)
+    ps = pd.to_numeric(f["ps_ratio"], errors="coerce") if "ps_ratio" in f.columns else pd.Series(index=stocks, dtype=float)
+    pcf = pd.to_numeric(f["pcf_ratio"], errors="coerce") if "pcf_ratio" in f.columns else pd.Series(index=stocks, dtype=float)
+    mc = pd.to_numeric(f["market_cap"], errors="coerce") if "market_cap" in f.columns else pd.Series(index=stocks, dtype=float)
+    roe = pd.to_numeric(f["roe"], errors="coerce") if "roe" in f.columns else pd.Series(index=stocks, dtype=float)
+    roa = pd.to_numeric(f["roa"], errors="coerce") if "roa" in f.columns else pd.Series(index=stocks, dtype=float)
+    gpm = pd.to_numeric(f["gross_profit_margin"], errors="coerce") if "gross_profit_margin" in f.columns else pd.Series(index=stocks, dtype=float)
+    gr = pd.to_numeric(f["inc_net_profit_year_on_year"], errors="coerce") if "inc_net_profit_year_on_year" in f.columns else pd.Series(index=stocks, dtype=float)
+    rev = pd.to_numeric(f["inc_revenue_year_on_year"], errors="coerce") if "inc_revenue_year_on_year" in f.columns else pd.Series(index=stocks, dtype=float)
+
+    mc = (mc * 1e8).reindex(stocks)
+    log_mc = np.log(mc.replace(0, np.nan)).replace([np.inf, -np.inf], np.nan)
+
+    ep = (1.0 / pe.replace(0, np.nan)).where(pe > 0)
+    bp = (1.0 / pb.replace(0, np.nan)).where(pb > 0)
+    sp = (1.0 / ps.replace(0, np.nan)).where(ps > 0)
+    cfp = (1.0 / pcf.replace(0, np.nan)).where(pcf > 0)
+
+    z_bp = zscore(winsorize(bp.reindex(stocks)))
+    z_ep = zscore(winsorize(ep.reindex(stocks)))
+    z_sp = zscore(winsorize(sp.reindex(stocks)))
+    z_cfp = zscore(winsorize(cfp.reindex(stocks)))
+    value = pd.concat([z_bp, z_ep, z_sp, z_cfp], axis=1).mean(axis=1).replace([np.inf, -np.inf], np.nan)
+
+    z_roe = zscore(winsorize(roe.reindex(stocks)))
+    z_roa = zscore(winsorize(roa.reindex(stocks)))
+    z_gpm = zscore(winsorize(gpm.reindex(stocks)))
+    quality = pd.concat([z_roe, z_roa, z_gpm], axis=1).mean(axis=1).replace([np.inf, -np.inf], np.nan)
+
+    z_gr = zscore(winsorize(gr.reindex(stocks)))
+    z_rev = zscore(winsorize(rev.reindex(stocks)))
+    growth = pd.concat([z_gr, z_rev], axis=1).mean(axis=1).replace([np.inf, -np.inf], np.nan)
+
+    ind = industry_series(stocks, end_dt=end_dt)
+    min_obs = int(g.conf.alpha_resid_min_obs)
+
+    neutralize = bool(g.conf.alpha_neutralize)
+    def _norm(s):
+        return zscore(winsorize(s.reindex(stocks))).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+
+    if neutralize:
+        value_r = _resid_by_size_industry(value, log_mc, ind, min_obs=min_obs)
+        quality_r = _resid_by_size_industry(quality, log_mc, ind, min_obs=min_obs)
+        growth_r = _resid_by_size_industry(growth, log_mc, ind, min_obs=min_obs)
+    else:
+        value_r = _norm(value)
+        quality_r = _norm(quality)
+        growth_r = _norm(growth)
+
+
+    accel_r = pd.Series(0.0, index=stocks)
+    if bool(g.conf.alpha_growth_accel_on):
+        try:
+            lag = int(max(20, int(g.conf.alpha_growth_accel_lag)))
+            prev_dt = shift_trade_day(end_dt, -lag)
+            q2 = query(valuation.code, indicator.inc_net_profit_year_on_year).filter(valuation.code.in_(stocks))
+            f2 = get_fundamentals(q2, date=prev_dt)
+            if f2 is not None and (not f2.empty) and ("inc_net_profit_year_on_year" in f2.columns):
+                gr_prev = pd.to_numeric(f2.set_index("code")["inc_net_profit_year_on_year"], errors="coerce").reindex(stocks)
+                gr_cur = pd.to_numeric(gr.reindex(stocks), errors="coerce")
+                accel = (gr_cur - gr_prev).replace([np.inf, -np.inf], np.nan)
+                accel = zscore(winsorize(accel)).replace([np.inf, -np.inf], np.nan)
+                accel_r = accel if (not neutralize) else _resid_by_size_industry(accel, log_mc, ind, min_obs=min_obs)
+        except Exception as e:
+            try:
+                log.warn(f"Error caught: {e}")
+            except:
+                print(f'Error caught: {e}')
+
+    w = dict(g.conf.alpha_weights or {})
+    if not w:
+        w = {"value": 0.30, "quality": 0.35, "growth": 0.35}
+
+    # 可选：动量也做正交化，避免和行业轮动重复；增加低波因子与风险调整动量
+    mom_scale = 1.0
+    mom_raw_scale = 1.0
+    lowvol_scale = 1.0
+    accel_scale = 1.0
+    if bool(g.conf.alpha_regime_on):
+        mkt = dict(g.conf.last_market or {})
+        risk_score = float(np.clip(mkt.get("risk_score", 0.5), 0.0, 1.0))
+        def _interp(pair, default_low=1.0, default_high=1.0):
+            try:
+                lo, hi = pair
+            except Exception:
+                lo, hi = default_low, default_high
+            return float(lo + (hi - lo) * risk_score)
+
+        w = dict(w)
+        base_sum = float(w.get("value", 0.0) + w.get("quality", 0.0) + w.get("growth", 0.0))
+        w["value"] = float(w.get("value", 0.0)) * _interp(g.conf.alpha_regime_value_scale)
+        w["quality"] = float(w.get("quality", 0.0)) * _interp(g.conf.alpha_regime_quality_scale)
+        w["growth"] = float(w.get("growth", 0.0)) * _interp(g.conf.alpha_regime_growth_scale)
+        scaled_sum = float(w.get("value", 0.0) + w.get("quality", 0.0) + w.get("growth", 0.0))
+        if base_sum > 0 and scaled_sum > 0:
+            norm = float(base_sum / scaled_sum)
+            w["value"] *= norm
+            w["quality"] *= norm
+            w["growth"] *= norm
+        mom_scale = _interp(g.conf.alpha_regime_mom_scale)
+        mom_raw_scale = _interp(g.conf.alpha_regime_mom_raw_scale)
+        lowvol_scale = _interp(g.conf.alpha_regime_lowvol_scale)
+        accel_scale = _interp(g.conf.alpha_regime_accel_scale)
+
+    mom_r = pd.Series(0.0, index=stocks)
+    mom_raw = pd.Series(0.0, index=stocks)
+    lowvol_r = pd.Series(0.0, index=stocks)
+    if bool(g.conf.alpha_mom_on) or bool(g.conf.alpha_lowvol_on):
+        use_multi = bool(g.conf.mom_multi_on)
+        lb = int(g.conf.mom12_lb)
+        skip = int(g.conf.mom12_skip)
+        lb_s = int(g.conf.mom_short_lb)
+        skip_s = int(g.conf.mom_short_skip)
+        lb_m = int(g.conf.mom_mid_lb)
+        skip_m = int(g.conf.mom_mid_skip)
+        lb_l = int(g.conf.mom_long_lb)
+        skip_l = int(g.conf.mom_long_skip)
+        need = int(max(lb + skip + 2, lb_s + skip_s + 2, lb_m + skip_m + 2, lb_l + skip_l + 2))
+        vol_lb = int(max(20, int(g.conf.mom_vol_lb)))
+        lowvol_lb = int(max(20, int(g.conf.alpha_lowvol_lb)))
+        try:
+            count = max(need, vol_lb + 2, lowvol_lb + 2)
+            px = get_price(stocks, count=count, end_date=end_dt, fields=["close"], panel=False)
+            close = px.pivot(index="time", columns="code", values="close").sort_index()
+            ret = close.pct_change().dropna(how="all")
+            if bool(g.conf.alpha_mom_on):
+                if use_multi:
+                    def _calc_mom(_lb, _skip):
+                        if close.shape[0] >= (_lb + _skip + 1):
+                            return close.iloc[-(_skip + 1)] / close.iloc[-(_lb + _skip + 1)] - 1.0
+                        if close.shape[0] >= 2:
+                            return close.iloc[-1] / close.iloc[0] - 1.0
+                        return pd.Series(0.0, index=stocks)
+                    mom_s = _calc_mom(lb_s, skip_s)
+                    mom_m = _calc_mom(lb_m, skip_m)
+                    mom_l = _calc_mom(lb_l, skip_l)
+                    if not ret.empty:
+                        vol = ret.iloc[-vol_lb:].std().replace(0, np.nan)
+                        mom_s = mom_s / vol
+                        mom_m = mom_m / vol
+                        mom_l = mom_l / vol
+                    z_s = zscore(winsorize(mom_s.reindex(stocks))).replace([np.inf, -np.inf], np.nan)
+                    z_m = zscore(winsorize(mom_m.reindex(stocks))).replace([np.inf, -np.inf], np.nan)
+                    z_l = zscore(winsorize(mom_l.reindex(stocks))).replace([np.inf, -np.inf], np.nan)
+                    w_s = float(g.conf.mom_w_short)
+                    w_m = float(g.conf.mom_w_mid)
+                    w_l = float(g.conf.mom_w_long)
+                    w_sum = float(abs(w_s) + abs(w_m) + abs(w_l))
+                    if (not np.isfinite(w_sum)) or w_sum <= 0:
+                        w_sum = 1.0
+                    mom_raw = (w_s * z_s + w_m * z_m + w_l * z_l) / w_sum
+                else:
+                    if close.shape[0] >= (lb + skip + 1):
+                        mom = close.iloc[-(skip + 1)] / close.iloc[-(lb + skip + 1)] - 1.0
+                    elif close.shape[0] >= 2:
+                        mom = close.iloc[-1] / close.iloc[0] - 1.0
+                    else:
+                        mom = pd.Series(0.0, index=stocks)
+                    if not ret.empty:
+                        vol = ret.iloc[-vol_lb:].std().replace(0, np.nan)
+                        mom = mom / vol
+                    mom_raw = mom
+                mom_raw = zscore(winsorize(mom_raw.reindex(stocks))).replace([np.inf, -np.inf], np.nan)
+                if neutralize:
+                    mom_r = _resid_by_size_industry(mom_raw, log_mc, ind, min_obs=min_obs)
+                else:
+                    mom_r = mom_raw.copy()
+            if bool(g.conf.alpha_lowvol_on) and (not ret.empty):
+                vol = ret.iloc[-lowvol_lb:].std().replace(0, np.nan)
+                lowvol = (-1.0) * zscore(winsorize(vol.reindex(stocks))).replace([np.inf, -np.inf], np.nan)
+                lowvol_r = lowvol if (not neutralize) else _resid_by_size_industry(lowvol, log_mc, ind, min_obs=min_obs)
+        except Exception as e:
+            try:
+                log.warn(f"Error caught: {e}")
+            except:
+                print(f'Error caught: {e}')
+
+    score = (
+        float(w.get("value", 0.0)) * value_r
+        + float(w.get("quality", 0.0)) * quality_r
+        + float(w.get("growth", 0.0)) * growth_r
+    )
+
+    accel_w = float(g.conf.alpha_growth_accel_weight) * float(accel_scale)
+    if bool(g.conf.alpha_growth_accel_on) and np.isfinite(accel_w) and abs(accel_w) > 0:
+        score = score + accel_w * accel_r
+
+    mom_w = float(g.conf.alpha_mom_weight) * float(mom_scale)
+    if bool(g.conf.alpha_mom_on) and np.isfinite(mom_w) and abs(mom_w) > 0:
+        score = score + mom_w * mom_r
+    mom_raw_w = float(g.conf.alpha_mom_raw_weight) * float(mom_raw_scale)
+    if bool(g.conf.alpha_mom_raw_on) and np.isfinite(mom_raw_w) and abs(mom_raw_w) > 0:
+        score = score + mom_raw_w * mom_raw
+    lowvol_w = float(g.conf.alpha_lowvol_weight) * float(lowvol_scale)
+    if bool(g.conf.alpha_lowvol_on) and np.isfinite(lowvol_w) and abs(lowvol_w) > 0:
+        score = score + lowvol_w * lowvol_r
+
+    score = zscore(winsorize(score)).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    diag = {
+        "alpha": {
+            "value": value_r,
+            "quality": quality_r,
+            "growth": growth_r,
+            "accel": accel_r,
+            "mom": mom_r,
+            "mom_raw": mom_raw,
+            "lowvol": lowvol_r,
+        }
+    }
+    return score.reindex(stocks).fillna(0.0), diag
+
+
+# -------------------- Pillar 3：Meta Optimizer（IC 统筹） --------------------
+def update_meta_weights_by_ic(end_dt):
+    snaps = list(g.conf.sig_snapshots or [])
+    if not snaps:
+        return
+
+    horizon = int(max(2, int(g.conf.ic_horizon)))
+    matured = []
+    for snap in snaps:
+        dt0 = snap.get("date", None)
+        if dt0 is None:
+            continue
+        due = shift_trade_day(dt0, horizon)
+        if end_dt >= due:
+            matured.append((snap, due))
+
+    if matured:
+        for snap, due in matured:
+            try:
+                _consume_meta_snapshot(snap, due_dt=due, horizon=horizon)
+            except Exception as e:
+                try:
+                    log.warn(f"Error caught: {e}")
+                except:
+                    print(f'Error caught: {e}')
+        matured_set = {id(s) for s, _ in matured}
+        g.conf.sig_snapshots = [s for s in snaps if id(s) not in matured_set]
+
+    win = int(g.conf.ic_window)
+    min_obs = int(g.conf.ic_min_obs)
+    h_ind = list(g.conf.ic_hist.get("ind", []))[-win:]
+    h_alpha = list(g.conf.ic_hist.get("alpha", []))[-win:]
+    if len(h_ind) < min_obs or len(h_alpha) < min_obs:
+        return
+
+    use_ir = bool(g.conf.meta_use_ir)
+    hl = float(g.conf.ic_halflife)
+
+    def _ewm_stats(arr):
+        s = pd.Series(arr, dtype=float).replace([np.inf, -np.inf], np.nan).dropna()
+        if s.empty:
+            return 0.0, 0.0, 0.0
+        if np.isfinite(hl) and hl > 0 and len(s) >= 2:
+            mu = float(s.ewm(halflife=hl, adjust=False).mean().iloc[-1])
+            try:
+                sig = float(s.ewm(halflife=hl, adjust=False).std(bias=False).iloc[-1])
+            except Exception:
+                sig = float(s.std())
+        else:
+            mu = float(s.mean())
+            sig = float(s.std())
+        if not np.isfinite(mu):
+            mu = 0.0
+        if not np.isfinite(sig):
+            sig = 0.0
+        ir = float(mu / (sig + 1e-6))
+        ir = float(np.clip(ir, -3.0, 3.0))
+        return mu, sig, ir
+
+    mu_ind, sig_ind, ir_ind = _ewm_stats(h_ind)
+    mu_alpha, sig_alpha, ir_alpha = _ewm_stats(h_alpha)
+
+    min_ir = float(g.conf.meta_min_ir)
+    min_ic = float(g.conf.meta_min_ic)
+
+    if use_ir:
+        score_ind = max(0.0, ir_ind - min_ir)
+        score_alpha = max(0.0, ir_alpha - min_ir)
+    else:
+        score_ind = max(0.0, mu_ind - min_ic)
+        score_alpha = max(0.0, mu_alpha - min_ic)
+
+    s_ind = 1.0
+    s_alpha = 1.0
+    if bool(g.conf.allow_contrarian):
+        key_ind = ir_ind if use_ir else mu_ind
+        key_alpha = ir_alpha if use_ir else mu_alpha
+        s_ind = 1.0 if key_ind >= 0 else -1.0
+        s_alpha = 1.0 if key_alpha >= 0 else -1.0
+
+    prev = dict(g.conf.meta_w or {"ind": 0.5, "alpha": 0.5})
+
+    tot = float(score_ind + score_alpha)
+    if tot <= 1e-8:
+        w_ind = float(prev.get("ind", 0.5))
+    else:
+        w_ind = float(score_ind / tot)
+    w_ind = float(np.clip(w_ind, 0.10, 0.90))
+    w_alpha = 1.0 - w_ind
+    smooth = float(np.clip(g.conf.meta_smooth, 0.0, 0.95))
+    w_ind = smooth * float(prev.get("ind", 0.5)) + (1.0 - smooth) * w_ind
+    w_alpha = 1.0 - w_ind
+
+    g.conf.meta_w = {"ind": float(w_ind), "alpha": float(w_alpha)}
+    g.conf.meta_sign = {"ind": float(s_ind), "alpha": float(s_alpha)}
+    g.conf.ic_diag = {
+        "mu_ind": mu_ind,
+        "sig_ind": sig_ind,
+        "ir_ind": ir_ind,
+        "mu_alpha": mu_alpha,
+        "sig_alpha": sig_alpha,
+        "ir_alpha": ir_alpha,
+        "w_ind": w_ind,
+        "w_alpha": w_alpha,
+        "sign": g.conf.meta_sign,
+    }
+
+
+def _consume_meta_snapshot(snap, due_dt, horizon):
+    sig = snap.get("signals", None)
+    if sig is None or sig.empty:
+        return
+    codes = sig.index.tolist()
+    if not codes:
+        return
+
+    px = get_price(codes, count=int(horizon) + 1, end_date=due_dt, fields=["close"], panel=False)
+    if px is None or px.empty:
+        return
+    close = px.pivot(index="time", columns="code", values="close").sort_index()
+    if close.shape[0] < 2:
+        return
+    fwd = (close.iloc[-1] / close.iloc[0] - 1.0).replace([np.inf, -np.inf], np.nan).dropna()
+    if fwd.empty:
+        return
+
+    hist = g.conf.ic_hist
+    if hist is None:
+        g.conf.ic_hist = {"ind": [], "alpha": []}
+        hist = g.conf.ic_hist
+
+    for k in ["ind", "alpha"]:
+        if k not in sig.columns:
+            continue
+        x = sig[k].reindex(fwd.index).astype(float)
+        y = fwd.astype(float)
+        m = x.notnull() & y.notnull()
+        if int(m.sum()) < 50:
+            continue
+        ic = float(x[m].rank().corr(y[m].rank()))
+        if not np.isfinite(ic):
+            continue
+        hist.setdefault(k, []).append(ic)
+        mx = int(g.conf.ic_window * 6)
+        if len(hist[k]) > mx:
+            hist[k] = hist[k][-mx:]
+
+
+# -------------------- 动态止盈止损 --------------------
+def calc_atr(code, end_dt, win=14):
+    px = get_price(code, count=int(win) + 1, end_date=end_dt, fields=["high", "low", "close"], panel=False)
+    px = _sort_price_df(px)
+    if px is None or px.empty or len(px) < int(win) + 1:
+        return np.nan
+    h, l, c = px["high"].values, px["low"].values, px["close"].values
+    tr = np.maximum(h[1:] - l[1:], np.maximum(np.abs(h[1:] - c[:-1]), np.abs(l[1:] - c[:-1])))
+    return float(np.mean(tr[-int(win) :]))
+
+
+def calc_vol(code, end_dt, win=60):
+    px = get_price(code, count=int(win) + 1, end_date=end_dt, fields=["close"], panel=False)
+    px = _sort_price_df(px)
+    if px is None or px.empty or len(px) < 6:
+        return np.nan
+    r = px["close"].pct_change().dropna()
+    return float(r.std()) if len(r) > 5 else np.nan
+
+
+def sync_pos_state(context, end_dt):
+    safe_set = set()
+    if g.conf.safe_etf:
+        safe_set.add(g.conf.safe_etf)
+    if g.conf.safe_etf2:
+        safe_set.add(g.conf.safe_etf2)
+
+    held = [s for s in context.portfolio.positions.keys() if s not in safe_set]
+    for s in list(g.conf.pos_state.keys()):
+        if s not in held:
+            g.conf.pos_state.pop(s, None)
+
+    for s in held:
+        pos = _get_pos_if_any(context, s)
+        if pos is None:
+            continue
+        entry = float(pos.avg_cost) if pos.avg_cost else last_price_or_prev_close(s, end_dt)
+        curp = last_price_or_prev_close(s, end_dt)
+        st = g.conf.pos_state.get(s, None)
+        if st is None:
+            g.conf.pos_state[s] = dict(entry=entry, entry_date=end_dt, high=curp, took_partial=False, stop_hits=0)
+        else:
+            st["entry"] = entry
+            st["high"] = max(float(st.get("high", curp)), curp)
+            st.setdefault("took_partial", False)
+            st.setdefault("stop_hits", 0)
+
+
+def manage_position_stops(context, end_dt, mkt):
+    sync_pos_state(context, end_dt)
+    risk_score = float(np.clip(mkt.get("risk_score", 0.5), 0.0, 1.0))
+    risk_off = bool(g.conf.risk_off)
+
+    for s, st in list(g.conf.pos_state.items()):
+        if s not in context.portfolio.positions or (not can_sell(s)):
+            continue
+        pos = context.portfolio.positions[s]
+        cur_amt = int(pos.total_amount)
+        if cur_amt <= 0:
+            continue
+
+        p = last_price_or_prev_close(s, end_dt)
+        if (not np.isfinite(p)) or p <= 0:
+            continue
+
+        entry = float(st.get("entry", p))
+        high = max(float(st.get("high", p)), p)
+        st["high"] = high
+
+        atr = calc_atr(s, end_dt, win=int(g.conf.atr_win))
+        vol = calc_vol(s, end_dt, win=int(g.conf.vol_win))
+        trail_pct = float(np.clip(2.2 * vol, g.conf.trail_pct_min, g.conf.trail_pct_max)) if np.isfinite(vol) else float(g.conf.trail_pct_min)
+
+        confirm_days = int(max(1, int(g.conf.stop_confirm_days)))
+        vol_thr = float(g.conf.stop_confirm_vol_thr)
+        if np.isfinite(vol) and np.isfinite(vol_thr) and vol_thr > 0 and float(vol) >= float(vol_thr):
+            confirm_days = 1
+
+        k_atr = float(g.conf.stop_atr_mult)
+        if risk_off or risk_score < 0.40:
+            k_atr = min(4.0, k_atr + 0.4)
+            trail_pct = min(float(g.conf.trail_pct_max), trail_pct * 1.10)
+        elif risk_score > 0.80:
+            k_atr = max(2.6, k_atr - 0.2)
+            trail_pct = max(float(g.conf.trail_pct_min), trail_pct * 0.92)
+
+        stop_fixed = entry * (1.0 - float(g.conf.stop_loss_pct))
+        stop_trail = high * (1.0 - trail_pct)
+        stop_atr = (high - k_atr * atr) if np.isfinite(atr) else stop_trail
+        stop_price = max(stop_fixed, stop_trail, stop_atr)
+
+        # 新开仓冷静期：先只用固定止损，减少噪声打出
+        try:
+            entry_dt = st.get("entry_date", end_dt)
+            hold_days = int((end_dt - entry_dt).days) if hasattr(end_dt, "__sub__") else 999
+        except Exception:
+            hold_days = 999
+        min_hold = int(max(0, int(g.conf.stop_min_hold_days)))
+        if hold_days < min_hold:
+            stop_price = stop_fixed
+
+        # 分批止盈：触发后抬高止损到保本附近
+        if bool(g.conf.partial_tp) and (not bool(st.get("took_partial", False))) and np.isfinite(atr) and atr > 0:
+            if (p - entry) >= float(g.conf.tp_atr_mult) * atr:
+                frac = float(np.clip(g.conf.tp_fraction, 0.1, 0.9))
+                sell_amt = int(cur_amt * frac / 100) * 100
+                if sell_amt >= 100:
+                    order_target_limited(context, s, cur_amt - sell_amt)
+                    st["took_partial"] = True
+                    stop_price = max(stop_price, entry * 1.01)
+
+        if p <= stop_price:
+            st["stop_hits"] = int(st.get("stop_hits", 0)) + 1
+            if int(st.get("stop_hits", 0)) >= int(confirm_days):
+                order_target_limited(context, s, 0)
+                g.conf.pos_state.pop(s, None)
+                try:
+                    cd = int(max(0, int(g.conf.stop_reentry_cooldown)))
+                    if cd > 0:
+                        until = shift_trade_day(end_dt, cd)
+                        g.conf.stop_blacklist[s] = until
+                except Exception as e:
+                    try:
+                        log.warn(f"Error caught: {e}")
+                    except:
+                        print(f'Error caught: {e}')
+        else:
+            st["stop_hits"] = 0
+
+
+# -------------------- 避险资产 --------------------
+def _pos_value(context, code, end_dt):
+    pos = _get_pos_if_any(context, code)
+    if pos is None:
+        return 0.0
+    try:
+        return float(pos.value)
+    except Exception:
+        try:
+            return float(pos.total_amount) * last_price_or_prev_close(code, end_dt)
+        except Exception:
+            return 0.0
+
+
+def adjust_safe_assets(context, end_dt, mkt, force=False):
+    if not bool(g.conf.safe_on) or not g.conf.safe_etf:
+        return
+
+    total = float(context.portfolio.total_value)
+    stock_expo = float(np.clip(g.conf.stock_expo_cur, 0.0, 1.0))
+    safe_target_value = total * max(0.0, 1.0 - stock_expo)
+
+    risk_off = bool(g.conf.risk_off) or bool(mkt.get("risk_off_now", False))
+    w2 = float(np.clip(g.conf.safe_etf2_weight, 0.0, 0.5)) if (risk_off and g.conf.safe_etf2) else 0.0
+    v2 = safe_target_value * w2 if g.conf.safe_etf2 else 0.0
+    v1 = max(0.0, safe_target_value - v2)
+
+    if not bool(force):
+        try:
+            cur_safe = _pos_value(context, g.conf.safe_etf, end_dt)
+            if g.conf.safe_etf2:
+                cur_safe += _pos_value(context, g.conf.safe_etf2, end_dt)
+        except Exception:
+            cur_safe = np.nan
+        tol_pct = float(np.clip(g.conf.safe_trade_tol_pct, 0.0, 0.05))
+        tol_val = float(max(0.0, g.conf.safe_trade_tol_value))
+        tol = float(max(total * tol_pct, tol_val))
+        if np.isfinite(cur_safe) and abs(float(cur_safe) - float(safe_target_value)) < tol:
+            return
+
+    order_target_value_lot(context, g.conf.safe_etf, v1, end_dt=end_dt, lot=100)
+    if g.conf.safe_etf2:
+        order_target_value_lot(context, g.conf.safe_etf2, v2, end_dt=end_dt, lot=100)
+
+
+# -------------------- 统筹再平衡（Pillar 1+2 -> FinalScore -> 交易） --------------------
+def _is_blacklisted(code, end_dt):
+    if not bool(g.conf.use_stops):
+        return False
+    bl = g.conf.stop_blacklist or {}
+    until = bl.get(code, None)
+    if until is None:
+        return False
+    try:
+        return _as_date(end_dt) < _as_date(until)
+    except Exception:
+        return False
+
+
+def _cap_and_redistribute(w, target_sum, cap):
+    w = pd.Series(w, dtype=float).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    w[w < 0] = 0.0
+    if (not np.isfinite(target_sum)) or target_sum <= 0 or w.sum() <= 0:
+        return w * 0.0
+    w = w / float(w.sum()) * float(target_sum)
+    if (not np.isfinite(cap)) or cap <= 0:
+        return w
+    cap = float(cap)
+    for _ in range(10):
+        over = w > cap
+        if not bool(over.any()):
+            break
+        excess = float((w[over] - cap).sum())
+        w[over] = cap
+        if excess <= 1e-12:
+            break
+        under = ~over
+        if not bool(under.any()):
+            break
+        s = float(w[under].sum())
+        if s <= 0:
+            break
+        w[under] = w[under] + w[under] / s * excess
+    return w
+
+
+def _signal_strength(sig, q=0.70, min_disp=0.40, max_disp=1.00):
+    s = sig.replace([np.inf, -np.inf], np.nan).dropna()
+    if s.empty:
+        return 0.0
+    q = float(np.clip(q, 0.55, 0.90))
+    hi = float(s.quantile(q))
+    lo = float(s.quantile(1.0 - q))
+    disp = float(hi - lo)
+    if not np.isfinite(disp):
+        return 0.0
+    if (not np.isfinite(min_disp)) or (not np.isfinite(max_disp)) or max_disp <= min_disp:
+        return float(disp > 0)
+    score = (disp - min_disp) / (max_disp - min_disp)
+    return float(np.clip(score, 0.0, 1.0))
+
+def rebalance(context, end_dt, mkt):
+    # 冷静期：直接切到避险（不做复杂再平衡）
+    if int(g.conf._cooldown_left) > 0 and bool(g.conf.full_liquidate_on_cooldown):
+        move_to_safe(context, end_dt)
+        return
+
+    universe = build_universe(end_dt)
+    if not universe:
+        move_to_safe(context, end_dt)
+        return
+
+    # Pillar 1 + 2：并行打分
+    ind_raw, ind_diag = compute_industry_vec(universe, end_dt)
+    alpha_raw, alpha_diag = compute_alpha_vec(universe, end_dt)
+    ind_sig = zscore(ind_raw.reindex(universe).fillna(0.0)).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    alpha_sig = alpha_raw.reindex(universe).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+
+    ind_strength = 1.0
+    if bool(g.conf.ind_aux_on):
+        ind_disp_min = float(g.conf.ind_disp_min)
+        ind_disp_max = float(g.conf.ind_disp_max)
+        ind_q = float(g.conf.signal_gate_q)
+        ind_strength = _signal_strength(ind_sig, q=ind_q, min_disp=ind_disp_min, max_disp=ind_disp_max)
+    # Meta：记录信号快照（用于未来收益计算 IC）
+    try:
+        snap_df = pd.DataFrame({"ind": ind_sig, "alpha": alpha_sig}, index=universe)
+        g.conf.sig_snapshots.append({"date": end_dt, "signals": snap_df})
+        if len(g.conf.sig_snapshots) > 60:
+            g.conf.sig_snapshots = g.conf.sig_snapshots[-60:]
+    except Exception as e:
+        try:
+            log.warn(f"Error caught: {e}")
+        except:
+            print(f'Error caught: {e}')
+
+    meta_w = dict(g.conf.meta_w or {"ind": 0.5, "alpha": 0.5})
+    meta_sign = dict(g.conf.meta_sign or {"ind": 1.0, "alpha": 1.0})
+    w_ind = float(meta_w.get("ind", 0.5))
+    w_alpha = float(meta_w.get("alpha", 1.0 - w_ind))
+    s_ind = float(meta_sign.get("ind", 1.0))
+    s_alpha = float(meta_sign.get("alpha", 1.0))
+
+    if ind_strength < 1.0:
+        w_ind = float(np.clip(w_ind * ind_strength, 0.0, 1.0))
+        w_alpha = float(np.clip(1.0 - w_ind, 0.0, 1.0))
+    final = (w_ind * s_ind * ind_sig) + (w_alpha * s_alpha * alpha_sig)
+    final = final.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    if (not np.isfinite(final.abs().sum())) or float(final.abs().sum()) <= 1e-8:
+        fallback = alpha_sig.copy()
+        if (not np.isfinite(fallback.abs().sum())) or float(fallback.abs().sum()) <= 1e-8:
+            fallback = ind_sig.copy()
+        final = fallback.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+
+    sig_q = float(g.conf.signal_gate_q)
+    sig_disp_min = float(g.conf.signal_disp_min)
+    sig_disp_max = float(g.conf.signal_disp_max)
+    sig_strength = _signal_strength(final, q=sig_q, min_disp=sig_disp_min, max_disp=sig_disp_max)
+    # ??????????????????
+    skip_gate = False
+    if bool(getattr(g.conf, "signal_gate_skip_on_risk", False)):
+        mkt = dict(g.conf.last_market or {})
+        rs = float(np.clip(mkt.get("risk_score", 0.5), 0.0, 1.0))
+        gate_on = float(getattr(g.conf, "signal_gate_risk_on", 1.0))
+        if rs >= gate_on:
+            skip_gate = True
+    if bool(g.conf.signal_gate_on) and (not skip_gate):
+        gate_q = float(np.clip(g.conf.signal_gate_q, 0.50, 0.95))
+        gate_min = float(g.conf.signal_gate_min)
+        sig_f = final.replace([np.inf, -np.inf], np.nan).dropna()
+        if sig_f.empty or float(sig_f.quantile(gate_q)) <= gate_min:
+            gate_expo = float(np.clip(g.conf.signal_gate_expo, 0.0, 1.0))
+            g.conf.stock_expo_cur = min(float(g.conf.stock_expo_cur), gate_expo)
+
+    # Signal boost for strong signals
+    if bool(getattr(g.conf, "signal_boost_on", False)):
+        boost_th = float(getattr(g.conf, "signal_boost_th", 0.70))
+        boost_expo = float(getattr(g.conf, "signal_boost_min_expo", g.conf.stock_expo_max))
+        if (not g.conf.risk_off) and sig_strength >= boost_th:
+            g.conf.stock_expo_cur = max(
+                float(g.conf.stock_expo_cur),
+                float(np.clip(boost_expo, 0.0, g.conf.stock_expo_max)),
+            )
+
+
+    # 现有持仓（排除避险 ETF）
+    safe_set = set()
+    if g.conf.safe_etf:
+        safe_set.add(g.conf.safe_etf)
+    if g.conf.safe_etf2:
+        safe_set.add(g.conf.safe_etf2)
+    # safe_on 关闭时，确保避险 ETF 不残留在组合里（避免 ETF 摩擦与风格污染）
+    if (not bool(g.conf.safe_on)) and safe_set:
+        for c in list(safe_set):
+            if c in context.portfolio.positions and can_sell(c):
+                order_target_limited(context, c, 0)
+    cur_stocks = [s for s in context.portfolio.positions.keys() if s not in safe_set]
+
+    total = float(context.portfolio.total_value)
+    if (not np.isfinite(total)) or total <= 0:
+        return
+
+    # ?????????
+    stock_expo = float(np.clip(g.conf.stock_expo_cur, 0.0, 1.0))
+    if bool(g.conf.signal_expo_on):
+        expo_min = float(np.clip(g.conf.signal_expo_min, 0.0, 1.0))
+        expo_max = float(np.clip(g.conf.signal_expo_max, 0.0, 1.0))
+        if expo_max < expo_min:
+            expo_max = expo_min
+        scale = expo_min + (expo_max - expo_min) * float(np.clip(sig_strength, 0.0, 1.0))
+        stock_expo = float(np.clip(stock_expo * scale, 0.0, float(g.conf.stock_expo_max)))
+    cash_reserve = float(max(0.0, g.conf.cash_reserve))
+    stock_budget = max(0.0, total * stock_expo - cash_reserve)
+    stock_expo_eff = float(stock_budget / total) if total > 0 else 0.0
+
+    # 股票预算为 0：清仓并调避险
+    if stock_expo_eff <= 0:
+        for s in cur_stocks:
+            if can_sell(s):
+                order_target_limited(context, s, 0)
+        adjust_safe_assets(context, end_dt, mkt, force=True)
+        return
+
+    # 动态 topN：预算不足时减少持仓数，避免碎片化（同时降低交易日拖累）
+    topN = int(max(1, g.conf.topN))
+    minN = int(max(1, g.conf.minN))
+    min_pos_value = float(max(0.0, g.conf.min_stock_pos_value))
+    if min_pos_value > 0 and stock_budget > 0:
+        feasible = int(stock_budget / min_pos_value)
+        topN_eff = int(np.clip(feasible, 5, topN))
+    else:
+        topN_eff = topN
+    topN_eff = int(np.clip(topN_eff, 5, topN))
+    minN_eff = int(min(minN, topN_eff))
+
+    exit_buffer = float(max(1.0, g.conf.exit_buffer))
+    hold_cut = int(max(topN_eff, round(topN_eff * exit_buffer)))
+
+    ranked = final.sort_values(ascending=False)
+    candidates = ranked.index.tolist()
+    mom_filter = None
+    mom_filters = []
+    lb = int(g.conf.buy_mom_lb or 0)
+    if lb > 1:
+        skip = int(g.conf.buy_mom_skip)
+        need = int(lb + skip + 2)
+        try:
+            px = get_price(candidates, count=need, end_date=end_dt, fields=["close"], panel=False)
+            close = px.pivot(index="time", columns="code", values="close").sort_index()
+            close.index = pd.to_datetime(close.index)
+            if close.shape[0] >= (lb + skip + 1):
+                mom = close.iloc[-(skip + 1)] / close.iloc[-(lb + skip + 1)] - 1.0
+            elif close.shape[0] >= 2:
+                mom = close.iloc[-1] / close.iloc[0] - 1.0
+            else:
+                mom = pd.Series(0.0, index=candidates)
+            mom = mom.reindex(candidates).replace([np.inf, -np.inf], np.nan).fillna(-9.0)
+            q = float(np.clip(g.conf.buy_mom_q, 0.10, 0.90))
+            thr = float(mom.quantile(q)) if (mom is not None and (not mom.empty)) else -np.inf
+            min_mom = float(g.conf.buy_mom_min)
+            thr = max(thr, min_mom)
+            mom_filters.append(mom >= thr)
+
+            lb_w = int(getattr(g.conf, "buy_mom_week_lb", 0) or 0)
+            if lb_w > 1:
+                skip_w = int(getattr(g.conf, "buy_mom_week_skip", 1))
+                close_w = close.resample("W-FRI").last().dropna(how="all")
+                if close_w.shape[0] >= (lb_w + skip_w + 1):
+                    mom_w = close_w.iloc[-(skip_w + 1)] / close_w.iloc[-(lb_w + skip_w + 1)] - 1.0
+                elif close_w.shape[0] >= 2:
+                    mom_w = close_w.iloc[-1] / close_w.iloc[0] - 1.0
+                else:
+                    mom_w = pd.Series(0.0, index=candidates)
+                mom_w = mom_w.reindex(candidates).replace([np.inf, -np.inf], np.nan).fillna(-9.0)
+                q_w = float(np.clip(getattr(g.conf, "buy_mom_week_q", 0.50), 0.10, 0.90))
+                thr_w = float(mom_w.quantile(q_w)) if (mom_w is not None and (not mom_w.empty)) else -np.inf
+                min_w = float(getattr(g.conf, "buy_mom_week_min", -0.05))
+                thr_w = max(thr_w, min_w)
+                mom_filters.append(mom_w >= thr_w)
+
+            lb_m = int(getattr(g.conf, "buy_mom_month_lb", 0) or 0)
+            if lb_m > 1:
+                skip_m = int(getattr(g.conf, "buy_mom_month_skip", 1))
+                close_m = close.resample("M").last().dropna(how="all")
+                if close_m.shape[0] >= (lb_m + skip_m + 1):
+                    mom_m = close_m.iloc[-(skip_m + 1)] / close_m.iloc[-(lb_m + skip_m + 1)] - 1.0
+                elif close_m.shape[0] >= 2:
+                    mom_m = close_m.iloc[-1] / close_m.iloc[0] - 1.0
+                else:
+                    mom_m = pd.Series(0.0, index=candidates)
+                mom_m = mom_m.reindex(candidates).replace([np.inf, -np.inf], np.nan).fillna(-9.0)
+                q_m = float(np.clip(getattr(g.conf, "buy_mom_month_q", 0.50), 0.10, 0.90))
+                thr_m = float(mom_m.quantile(q_m)) if (mom_m is not None and (not mom_m.empty)) else -np.inf
+                min_m = float(getattr(g.conf, "buy_mom_month_min", -0.05))
+                thr_m = max(thr_m, min_m)
+                mom_filters.append(mom_m >= thr_m)
+
+            if mom_filters:
+                gate_and = bool(getattr(g.conf, "buy_mom_gate", True))
+                filt = mom_filters[0]
+                for f in mom_filters[1:]:
+                    filt = (filt & f) if gate_and else (filt | f)
+                mom_filter = filt
+        except Exception:
+            mom_filter = None
+
+    # 买入候选：排除止损黑名单 + 不可买
+    buy_list = []
+    for s in candidates:
+        if len(buy_list) >= topN_eff:
+            break
+        if _is_blacklisted(s, end_dt):
+            continue
+        if mom_filter is not None and (not bool(mom_filter.get(s, False))):
+            continue
+        if not can_buy(s, end_dt=end_dt):
+            continue
+        buy_list.append(s)
+
+    if len(buy_list) < minN_eff and (not bool(getattr(g.conf, "strict_mom_gate", False))):
+        buy_list = []
+        for s in candidates:
+            if len(buy_list) >= topN_eff:
+                break
+            if _is_blacklisted(s, end_dt):
+                continue
+            if not can_buy(s, end_dt=end_dt):
+                continue
+            buy_list.append(s)
+
+    # 持仓缓冲：只“保留”不强制加仓，降低换手
+    keep = []
+    for s in cur_stocks:
+        if _is_blacklisted(s, end_dt):
+            continue
+        if s in ranked.index:
+            try:
+                r = int(ranked.index.get_loc(s))
+            except Exception:
+                continue
+            if r < hold_cut:
+                keep.append(s)
+
+    target = []
+    seen = set()
+    for s in buy_list + keep:
+        if s in seen:
+            continue
+        seen.add(s)
+        target.append(s)
+        if len(target) >= hold_cut:
+            break
+
+    if not target:
+        for s in cur_stocks:
+            if can_sell(s):
+                order_target_limited(context, s, 0)
+        adjust_safe_assets(context, end_dt, mkt, force=True)
+        return
+
+    # 现仓权重（用于混合，减少换手）
+    cur_w = pd.Series(dtype=float)
+    if cur_stocks:
+        cur_w = pd.Series({s: float(context.portfolio.positions[s].value) / total for s in cur_stocks if s in context.portfolio.positions}, dtype=float)
+    cur_w = cur_w.reindex(target).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+
+    # 新权重：分数（rank）× 逆波动 × 流动性惩罚
+    score_t = final.reindex(target).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    rnk = score_t.rank(ascending=False, method="first")
+    score_w = (len(score_t) + 1 - rnk).astype(float).clip(lower=1.0)
+
+    inv_vol = pd.Series(1.0, index=target)
+    liq_adj = pd.Series(1.0, index=target)
+    lookback = int(max(10, int(g.conf.vol_win)))
+    try:
+        px = get_price(target, count=lookback + 1, end_date=end_dt, fields=["close", "money"], panel=False)
+        if px is not None and (not px.empty):
+            close = px.pivot(index="time", columns="code", values="close").sort_index()
+            ret = close.pct_change().dropna(how="all")
+            if ret is not None and (not ret.empty):
+                vol = ret.std().replace(0, np.nan)
+                inv_vol = (1.0 / vol).replace([np.inf, -np.inf], np.nan).fillna(0.0).reindex(target).fillna(0.0)
+                inv_pow = float(np.clip(g.conf.inv_vol_power, 0.0, 2.0))
+                if inv_pow == 0:
+                    inv_vol = pd.Series(1.0, index=target)
+                elif inv_pow != 1.0:
+                    inv_vol = inv_vol.pow(inv_pow)
+            if "money" in px.columns:
+                money = px.pivot(index="time", columns="code", values="money").mean()
+                ref = float(max(1.0, g.conf.liq_weight_ref))
+                liq_adj = (money / ref).clip(lower=0.2, upper=1.0).replace([np.inf, -np.inf], np.nan).fillna(0.5).reindex(target).fillna(0.5)
+    except Exception as e:
+        try:
+            log.warn(f"Error caught: {e}")
+        except:
+            print(f'Error caught: {e}')
+
+    # 可选：流通市值加权（市值加权 + Alpha 微调），降低小票冲击成本
+    size_adj = pd.Series(1.0, index=target)
+    pwr = float(np.clip(g.conf.size_weight_power, 0.0, 1.0))
+    if pwr > 0:
+        try:
+            q = query(valuation.code, valuation.circulating_market_cap).filter(valuation.code.in_(target))
+            cm = get_fundamentals(q, date=end_dt)
+            if cm is not None and (not cm.empty) and ("circulating_market_cap" in cm.columns):
+                cmc = pd.to_numeric(cm.set_index("code")["circulating_market_cap"], errors="coerce").reindex(target)
+                med = float(np.nanmedian(cmc.values))
+                if np.isfinite(med) and med > 0:
+                    size_adj = (cmc / med).pow(pwr).clip(lower=0.5, upper=2.0).replace([np.inf, -np.inf], np.nan).fillna(1.0)
+        except Exception as e:
+            try:
+                log.warn(f"Error caught: {e}")
+            except:
+                print(f'Error caught: {e}')
+
+    raw = (score_w * inv_vol * liq_adj * size_adj).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    if float(raw.sum()) <= 0:
+        raw[:] = 1.0
+    new_w = raw / float(raw.sum())
+    new_w = new_w * stock_expo_eff
+
+    # 按 join_Think：不做固定比例惯性混合；如需控换手，使用换手约束（自适应缩放差值）
+    tgt_w = new_w.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    max_to = float(np.clip(g.conf.max_turnover, 0.0, 2.0))
+    if max_to > 0 and (not cur_w.empty):
+        try:
+            to = float((tgt_w - cur_w).abs().sum() / 2.0)
+            if np.isfinite(to) and to > max_to and to > 1e-12:
+                k = float(max_to / to)
+                tgt_w = (cur_w + (tgt_w - cur_w) * k).clip(lower=0.0)
+        except Exception as e:
+            try:
+                log.warn(f"Error caught: {e}")
+            except:
+                print(f'Error caught: {e}')
+
+    cap = float(np.clip(g.conf.max_single_weight, 0.02, 0.30))
+    tgt_w = _cap_and_redistribute(tgt_w, target_sum=stock_expo_eff, cap=cap)
+
+    target_value = {s: float(tgt_w.get(s, 0.0)) * total for s in target}
+
+    # 先卖：不在目标集合/目标权重为 0
+    for s in cur_stocks:
+        if (s not in target_value) or (float(target_value.get(s, 0.0)) <= 0.0) or _is_blacklisted(s, end_dt):
+            if can_sell(s):
+                order_target_limited(context, s, 0)
+
+    trade_tol = float(max(0.0, g.conf.trade_tol))
+
+    # 再减仓（释放现金）
+    for s in target:
+        tv = float(target_value.get(s, 0.0))
+        pos = _get_pos_if_any(context, s)
+        cv = float(pos.value) if pos is not None else 0.0
+        cw = float(cv / total) if total > 0 else 0.0
+        tw = float(tgt_w.get(s, 0.0))
+        if abs(tw - cw) < trade_tol:
+            continue
+        if tv < cv and can_sell(s):
+            order_target_value_lot(context, s, tv, end_dt=end_dt, lot=100)
+
+    # 最后买入/加仓
+    for s in target:
+        tv = float(target_value.get(s, 0.0))
+        pos = _get_pos_if_any(context, s)
+        cv = float(pos.value) if pos is not None else 0.0
+        cw = float(cv / total) if total > 0 else 0.0
+        tw = float(tgt_w.get(s, 0.0))
+        if abs(tw - cw) < trade_tol:
+            continue
+        if tv > cv and can_buy(s, end_dt=end_dt) and (not _is_blacklisted(s, end_dt)):
+            order_target_value_lot(context, s, tv, end_dt=end_dt, lot=100)
+
+    # 收尾：按股票暴露配置避险 ETF
+    adjust_safe_assets(context, end_dt, mkt, force=True)
+
+
+def move_to_safe(context, end_dt):
+    safe_on = bool(g.conf.safe_on) and bool(g.conf.safe_etf)
+    safe_set = set()
+    if safe_on:
+        safe_set.add(g.conf.safe_etf)
+        if g.conf.safe_etf2:
+            safe_set.add(g.conf.safe_etf2)
+
+    # 先清仓：safe_on 关闭时清所有（含避险 ETF），否则只保留避险 ETF
+    cur = [s for s in context.portfolio.positions.keys() if s not in safe_set]
+    for s in cur:
+        if can_sell(s):
+            order_target_limited(context, s, 0)
+
+    if not safe_on:
+        return
+
+    # 配置避险
+    total = float(context.portfolio.total_value)
+    w2 = float(np.clip(g.conf.safe_etf2_weight, 0.0, 0.5)) if g.conf.safe_etf2 else 0.0
+    v2 = total * w2
+    v1 = max(0.0, total - v2)
+    order_target_value_lot(context, g.conf.safe_etf, v1, end_dt=end_dt, lot=100)
+    if g.conf.safe_etf2:
+        order_target_value_lot(context, g.conf.safe_etf2, v2, end_dt=end_dt, lot=100)
